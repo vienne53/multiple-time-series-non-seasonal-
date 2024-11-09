@@ -1,0 +1,203 @@
+# 读取数据集
+library(readxl)
+setwd("D:/6060")  # 设置工作目录，确保所有文件保存在指定路径
+library(dplyr)
+library(ggplot2)
+library(forecast)
+library(broom)
+library(officer)
+library(flextable)
+library(tseries)  # 用于自相关性检验
+
+# 读取数据集
+data <- read_excel("D:/6060/6060.xlsx")
+data <- data %>% mutate(Year = as.numeric(Year))  # 将年份转换为数值类型
+
+# 将数据转换为矩阵以设置行名
+# 注意：tibble 不支持设置行名，因此将数据转换为数据框并使用列作为标识符
+data <- as.data.frame(data)
+rownames(data) <- data$Year  # 将年份设置为行名
+data <- data %>% select(-Year)  # 删除年份列
+
+# 将数据转换为数值类型
+data <- data %>% mutate_all(as.numeric)
+
+# 数据归一化
+normalize <- function(x) {
+  return((x - min(x)) / (max(x) - min(x)))
+}
+data_normalized <- as.data.frame(lapply(data, normalize))  # 对所有列进行归一化处理
+
+# 一阶差分
+data_diff <- diff(as.matrix(data_normalized), differences = 1)
+data_diff <- data.frame(data_diff)  # 转换为数据框格式
+
+# 绘制差分后的序列并保存为一个合并的图像
+png(filename = "D:/6060/differenced_series_combined.png", width = 1200, height = 800, units = "px")  # 修复文件输出
+par(mfrow = c(4, 6))  # 设置布局以便将所有图放在一张图中
+for (i in 1:ncol(data_diff)) {
+  plot(data_diff[, i], type='l', main=colnames(data_diff)[i], xlab='Year', ylab=colnames(data_diff)[i])
+}
+dev.off()  # 关闭图形设备，保存图像
+
+# 检查文件是否成功保存
+if (file.exists("D:/6060/differenced_series_combined.png")) {
+  print("差分后的序列图已成功保存.")
+} else {
+  print("未能成功保存差分后的序列图.")
+}
+
+# 将数据分为训练集和测试集
+train_size <- floor(0.85 * nrow(data_diff))  # 计算训练集大小
+traindata <- data_diff[1:train_size, ]  # 训练集数据
+testdata <- data_diff[(train_size + 1):nrow(data_diff), ]  # 测试集数据
+
+# 自相关性检验并保存ACF图
+png(filename = "D:/6060/acf_plot.png", width = 800, height = 600, units = "px")
+acf(traindata[, 1], main = "自相关函数 (ACF) 图")
+dev.off()
+
+# 检查ACF图是否成功保存
+if (file.exists("D:/6060/acf_plot.png")) {
+  print("自相关函数图已成功保存.")
+} else {
+  print("未能成功保存自相关函数图.")
+}
+
+# 使用最佳 (p, d, q) 构建ARIMAX模型
+best_aic <- Inf
+best_order <- c(0, 0, 0)
+
+for (p in 0:3) {
+  for (d in 0:1) {
+    for (q in 0:3) {
+      try({
+        fit <- auto.arima(traindata[,1], xreg = as.matrix(traindata[, -1]), d = d, max.p = p, max.q = q, seasonal = FALSE, stepwise = FALSE, approximation = FALSE)
+        if (fit$aic < best_aic) {
+          best_aic <- fit$aic
+          best_order <- c(p, d, q)
+        }
+      }, silent = TRUE)
+    }
+  }
+}
+
+print(paste("最佳模型阶数: AR =", best_order[1], "D =", best_order[2], "MA =", best_order[3]))
+
+# 构建最终ARIMAX模型（减少复杂度）
+final_fit <- auto.arima(traindata[, 1], xreg = as.matrix(traindata[, 2:4]), d = best_order[2], max.p = best_order[1], max.q = best_order[3], seasonal = FALSE, stepwise = FALSE, approximation = FALSE)
+summary(final_fit)  # 输出模型摘要
+
+# 使用broom包创建包含系数、t值和p值的数据框
+coefficients_df <- tidy(final_fit)
+print(coefficients_df)
+
+# 将系数保存到Word文档
+doc <- read_docx()
+coef_table <- flextable(coefficients_df)
+doc <- body_add_flextable(doc, coef_table)
+doc <- body_add_par(doc, "\n模型残差诊断:", style = "heading 2")
+
+# 将回归方程添加到Word文档
+formula_string <- paste0("Y_t = ", round(coefficients_df$estimate[1], 4), " + ",
+                        paste(paste0(round(coefficients_df$estimate[-1], 4), "*", coefficients_df$term[-1]), collapse = " + "))
+doc <- body_add_par(doc, "时间序列回归方程:", style = "heading 2")
+doc <- body_add_par(doc, formula_string, style = "Normal")
+
+# 添加参数解释
+parameter_explanation <- "\n参数解释:\n- 截距表示当所有预测变量为零时响应变量的基准水平。\n- 每个系数表示在保持其他预测变量不变的情况下，相应预测变量增加一个单位时响应变量的预期变化。"
+doc <- body_add_par(doc, parameter_explanation, style = "Normal")
+
+# 预测未来值（基于时间顺序进行预测）
+future_forecast <- forecast(final_fit, xreg = as.matrix(testdata[, 2:4]), h = nrow(testdata), level = c(95))
+
+# 对预测值进行反归一化
+# 反归一化函数
+denormalize <- function(x, min_val, max_val) {
+  return(x * (max_val - min_val) + min_val)
+}
+original_min <- min(data$`Annual CO₂ emissions(t)`)
+original_max <- max(data$`Annual CO₂ emissions(t)`)
+future_forecast$mean <- denormalize(future_forecast$mean, original_min, original_max)
+future_forecast$lower <- denormalize(future_forecast$lower, original_min, original_max)
+future_forecast$upper <- denormalize(future_forecast$upper, original_min, original_max)
+
+# 创建预测年份序列
+start_year <- max(as.numeric(rownames(data))) + 1
+forecast_years <- seq(start_year, length.out = length(future_forecast$mean))
+
+# 将原始数据转换为数据框，以便 ggplot 使用
+original_data_df <- data.frame(
+  Year = as.numeric(rownames(data)),
+  Emissions = data$`Annual CO₂ emissions(t)`
+)
+
+# 将预测数据转换为数据框
+future_forecast_df <- data.frame(
+  Year = forecast_years,
+  Mean = future_forecast$mean,
+  Lower = future_forecast$lower[, ifelse(ncol(future_forecast$lower) > 1, 2, 1)],
+  Upper = future_forecast$upper[, ifelse(ncol(future_forecast$upper) > 1, 2, 1)]
+)
+
+# 绘制原始数据与预测数据并保存图像
+forecast_plot <- ggplot() +
+  geom_line(data = original_data_df, aes(x = Year, y = Emissions), color = 'blue', linewidth = 1) +
+  geom_line(data = future_forecast_df, aes(x = Year, y = Mean), color = 'red', linetype = "dashed") +
+  geom_ribbon(data = future_forecast_df, aes(x = Year, ymin = Lower, ymax = Upper), fill = 'blue', alpha = 0.15) +
+  labs(title = "ARIMAX 预测与原始数据对比", x = "年份", y = "年CO₂排放量 (t)") +
+  theme_minimal()
+
+ggsave("D:/6060/forecast_vs_original.png", plot = forecast_plot, width = 12, height = 8, units = "in")  # 修复图像输出尺寸问题
+
+# 检查预测图是否成功保存
+if (file.exists("D:/6060/forecast_vs_original.png")) {
+  print("预测图已成功保存.")
+} else {
+  print("未能成功保存预测图.")
+}
+
+# 将预测图添加到Word文档
+if (file.exists("D:/6060/forecast_vs_original.png")) {
+  doc <- body_add_par(doc, "\n预测图:", style = "heading 2")
+  doc <- body_add_img(doc, src = "D:/6060/forecast_vs_original.png", width = 6, height = 4)
+} else {
+  print("预测图文件不存在，无法添加到Word文档中。")
+}
+
+# 将一阶差分序列图添加到Word文档
+if (file.exists("D:/6060/differenced_series_combined.png")) {
+  doc <- body_add_par(doc, "\n一阶差分序列图:", style = "heading 2")
+  doc <- body_add_img(doc, src = "D:/6060/differenced_series_combined.png", width = 6, height = 4)
+} else {
+  print("差分序列图文件不存在，无法添加到Word文档中。")
+}
+
+# 将自相关性检验的图添加到Word文档
+if (file.exists("D:/6060/acf_plot.png")) {
+  doc <- body_add_par(doc, "\n自相关性检验图:", style = "heading 2")
+  doc <- body_add_img(doc, src = "D:/6060/acf_plot.png", width = 6, height = 4)
+} else {
+  print("自相关性检验图文件不存在，无法添加到Word文档中。")
+}
+
+# 模型评估
+mae <- mean(abs(testdata[, 1] - future_forecast$mean))  # 平均绝对误差
+rmse <- sqrt(mean((testdata[, 1] - future_forecast$mean)^2))  # 均方根误差
+evaluation_df <- data.frame(MAE = mae, RMSE = rmse)
+print(evaluation_df)
+
+# 将评估指标添加到Word文档
+# 将生成的Word文档保存
+doc <- body_add_par(doc, "\n模型评估:", style = "heading 2")
+eval_table <- flextable(evaluation_df)
+doc <- body_add_flextable(doc, eval_table)
+print(doc, target = "D:/6060/ARIMAX_model_summary.docx")
+
+# 检查Word文件是否成功保存
+if (file.exists("D:/6060/ARIMAX_model_summary.docx")) {
+  print("Word文件已成功保存到 D:/6060/ARIMAX_model_summary.docx.")
+} else {
+  print("未能成功保存Word文件.")
+}
+  
